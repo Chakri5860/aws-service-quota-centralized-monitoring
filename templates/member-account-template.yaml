@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Member Account - Forward Service Quota Increase events to central EventBridge bus.
+  Deploy via CloudFormation StackSet across all member accounts.
+
+Parameters:
+  CentralEventBusArn:
+    Type: String
+    Description: ARN of the centralized EventBridge custom bus in the monitoring account
+    AllowedPattern: '^arn:aws:events:[a-z0-9-]+:\d{12}:event-bus/.+$'
+    ConstraintDescription: Must be a valid EventBridge event bus ARN
+
+Resources:
+  #------------------------------------------------------------
+  # IAM Role for EventBridge to forward events cross-account
+  #------------------------------------------------------------
+  EventBridgeForwardingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ServiceQuotaEventForwardingRole
+      Description: Allows EventBridge to forward Service Quota events to central bus
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsToCentralBus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CentralEventBusArn
+
+  #------------------------------------------------------------
+  # EventBridge Rule - Capture Service Quota Increase Requests
+  # CRITICAL: detail-type MUST be "AWS API Call via CloudTrail"
+  #------------------------------------------------------------
+  ServiceQuotaIncreaseRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ForwardServiceQuotaIncrease
+      Description: Captures RequestServiceQuotaIncrease API calls and forwards to central bus
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.servicequotas
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventName:
+            - RequestServiceQuotaIncrease
+      Targets:
+        - Id: CentralEventBusTarget
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeForwardingRole.Arn
+
+Outputs:
+  ForwardingRuleArn:
+    Description: ARN of the EventBridge forwarding rule
+    Value: !GetAtt ServiceQuotaIncreaseRule.Arn
+  ForwardingRoleArn:
+    Description: ARN of the IAM forwarding role
+    Value: !GetAtt EventBridgeForwardingRole.Arn
