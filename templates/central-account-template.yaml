@@ -1,0 +1,379 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Central Account - Receive Service Quota Increase events from all member accounts,
+  process via Lambda, and send formatted email alerts via SNS.
+
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: AWS Organization ID (e.g., o-abc123def4)
+    AllowedPattern: '^o-[a-z0-9]{10,32}$'
+    ConstraintDescription: Must be a valid AWS Organization ID
+
+  AlertEmailAddress:
+    Type: String
+    Description: Email address to receive Service Quota increase alerts
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+  EnableSupportCaseLookup:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable Support Case ID lookup (requires Business/Enterprise Support plan
+      and cross-account role in member accounts)
+
+  EnableAccountNameResolution:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable Account Name resolution via AWS Organizations API
+
+Resources:
+  #------------------------------------------------------------
+  # Custom EventBridge Bus - Receives events from all accounts
+  #------------------------------------------------------------
+  CentralEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: service-quota-monitoring-bus
+
+  #------------------------------------------------------------
+  # Resource Policy - Allow all org accounts to put events
+  # Uses aws:PrincipalOrgID to avoid listing 200+ account IDs
+  #------------------------------------------------------------
+  CentralEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref CentralEventBus
+      StatementId: AllowOrganizationPutEvents
+      Action: events:PutEvents
+      Principal: '*'
+      Condition:
+        Type: StringEquals
+        Key: aws:PrincipalOrgID
+        Value: !Ref OrganizationId
+
+  #------------------------------------------------------------
+  # EventBridge Rule on Custom Bus - Routes to Lambda
+  #------------------------------------------------------------
+  ServiceQuotaRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ProcessServiceQuotaIncrease
+      Description: Route Service Quota Increase events to Lambda for processing
+      EventBusName: !Ref CentralEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.servicequotas
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventName:
+            - RequestServiceQuotaIncrease
+      Targets:
+        - Id: LambdaProcessor
+          Arn: !GetAtt QuotaAlertLambda.Arn
+
+  #------------------------------------------------------------
+  # SNS Topic for Email Alerts
+  #------------------------------------------------------------
+  QuotaAlertSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: service-quota-increase-alerts
+      DisplayName: AWS Service Quota Alerts
+
+  QuotaAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref QuotaAlertSNSTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmailAddress
+
+  #------------------------------------------------------------
+  # Lambda Function - Process Events and Send Formatted Alerts
+  #------------------------------------------------------------
+  QuotaAlertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ServiceQuotaIncreaseAlert
+      Description: Processes Service Quota Increase events and sends formatted SNS alerts
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref QuotaAlertSNSTopic
+          ENABLE_SUPPORT_CASE_LOOKUP: !Ref EnableSupportCaseLookup
+          ENABLE_ACCOUNT_NAME_RESOLUTION: !Ref EnableAccountNameResolution
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import logging
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sns_client = boto3.client('sns')
+          orgs_client = boto3.client('organizations')
+
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          ENABLE_SUPPORT_LOOKUP = os.environ.get('ENABLE_SUPPORT_CASE_LOOKUP', 'false').lower() == 'true'
+          ENABLE_ACCOUNT_NAME = os.environ.get('ENABLE_ACCOUNT_NAME_RESOLUTION', 'true').lower() == 'true'
+
+          def get_account_name(account_id):
+              """Resolve Account ID to Account Name using AWS Organizations API."""
+              if not ENABLE_ACCOUNT_NAME:
+                  return None
+              try:
+                  response = orgs_client.describe_account(AccountId=account_id)
+                  return response['Account']['Name']
+              except ClientError as e:
+                  logger.warning(f"Could not resolve account name for {account_id}: {e}")
+                  return None
+              except Exception as e:
+                  logger.warning(f"Unexpected error resolving account name: {e}")
+                  return None
+
+          def get_support_case_id(account_id, service_code, quota_code, region):
+              """
+              Best-effort lookup for associated Support Case ID.
+              NOTE: The Support API is only available in us-east-1.
+              Many quota increases are auto-approved without creating a case.
+              """
+              if not ENABLE_SUPPORT_LOOKUP:
+                  return None
+              try:
+                  support_client = boto3.client('support', region_name='us-east-1')
+                  response = support_client.describe_cases(
+                      includeResolvedCases=False,
+                      includeCommunications=False,
+                      maxResults=10
+                  )
+                  for case in response.get('cases', []):
+                      subject = case.get('subject', '').lower()
+                      if service_code.lower() in subject or quota_code.lower() in subject:
+                          return case.get('displayId', case.get('caseId'))
+                  return None
+              except ClientError as e:
+                  logger.warning(f"Could not lookup support case: {e}")
+                  return None
+              except Exception as e:
+                  logger.warning(f"Unexpected error looking up support case: {e}")
+                  return None
+
+          def extract_requester_info(detail):
+              """Extract requester ARN from userIdentity or nested requester field."""
+              user_identity = detail.get('userIdentity', {})
+              requester_arn = user_identity.get('arn', '')
+              if not requester_arn:
+                  requested_quota = detail.get('responseElements', {}).get('requestedQuota', {})
+                  requester_str = requested_quota.get('requester', '{}')
+                  try:
+                      requester_data = json.loads(requester_str)
+                      requester_arn = requester_data.get('callerArn', 'N/A')
+                  except (json.JSONDecodeError, TypeError):
+                      requester_arn = 'N/A'
+              return requester_arn
+
+          def lambda_handler(event, context):
+              """
+              Process RequestServiceQuotaIncrease EventBridge event
+              and send formatted email via SNS.
+              """
+              logger.info(f"Received event: {json.dumps(event)}")
+
+              try:
+                  detail = event.get('detail', {})
+
+                  request_params = detail.get('requestParameters', {})
+                  response_elements = detail.get('responseElements', {})
+                  requested_quota = response_elements.get('requestedQuota', {})
+
+                  account_id = detail.get('recipientAccountId',
+                      detail.get('userIdentity', {}).get('accountId', 'Unknown'))
+                  region = detail.get('awsRegion', event.get('region', 'Unknown'))
+
+                  service_code = request_params.get('serviceCode',
+                      requested_quota.get('serviceCode', 'Unknown'))
+                  service_name = requested_quota.get('serviceName', service_code)
+                  quota_code = request_params.get('quotaCode',
+                      requested_quota.get('quotaCode', 'Unknown'))
+                  quota_name = requested_quota.get('quotaName', quota_code)
+                  desired_value = request_params.get('desiredValue',
+                      requested_quota.get('desiredValue', 'N/A'))
+
+                  status = requested_quota.get('status', 'Unknown')
+                  quota_request_id = requested_quota.get('id', 'N/A')
+                  quota_arn = requested_quota.get('quotaArn', 'N/A')
+                  event_time = detail.get('eventTime', event.get('time', 'Unknown'))
+
+                  requester_arn = extract_requester_info(detail)
+
+                  account_name = get_account_name(account_id)
+                  account_display = account_name if account_name else f"Account {account_id}"
+
+                  support_case_id = get_support_case_id(
+                      account_id, service_code, quota_code, region
+                  )
+                  support_case_display = support_case_id if support_case_id else "N/A (auto-approved or pending)"
+
+                  separator = "=" * 55
+                  divider = "-" * 55
+
+                  email_subject = (
+                      f"Service Quota Increase - "
+                      f"{service_name} - {account_display}"
+                  )
+
+                  email_body = f"""{separator}
+          AWS SERVICE QUOTA INCREASE REQUEST
+          {separator}
+
+          Account Name:    {account_display}
+          Account ID:      {account_id}
+          Region:          {region}
+          Time:            {event_time}
+
+          {divider}
+          QUOTA DETAILS
+          {divider}
+
+          Service:         {service_name}
+          Quota:           {quota_name}
+          Quota Code:      {quota_code}
+          Requested Value: {desired_value}
+          Status:          {status}
+
+          {divider}
+          TRACKING INFORMATION
+          {divider}
+
+          Quota Request ID: {quota_request_id}
+          Quota ARN:        {quota_arn}
+          Support Case:     {support_case_display}
+          Requested By:     {requester_arn}
+
+          {separator}
+          This alert was generated by the centralized Service Quota
+          monitoring system via Amazon EventBridge.
+
+          To view this request in the AWS Console:
+          https://{region}.console.aws.amazon.com/servicequotas/home/services/{service_code}/quotas/{quota_code}
+          {separator}
+          """
+
+                  response = sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Subject=email_subject[:100],
+                      Message=email_body
+                  )
+
+                  logger.info(f"SNS publish successful. MessageId: {response['MessageId']}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Alert sent successfully',
+                          'messageId': response['MessageId'],
+                          'accountId': account_id,
+                          'quotaRequestId': quota_request_id
+                      })
+                  }
+
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  logger.error(f"Event was: {json.dumps(event)}")
+                  try:
+                      sns_client.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject="ERROR: Service Quota Alert Processing Failed",
+                          Message=(
+                              f"Failed to process Service Quota Increase event.\n"
+                              f"Error: {str(e)}\n\n"
+                              f"Raw Event:\n{json.dumps(event, indent=2)}"
+                          )
+                      )
+                  except Exception:
+                      pass
+                  raise
+
+  #------------------------------------------------------------
+  # Lambda Permission - Allow EventBridge to invoke
+  #------------------------------------------------------------
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QuotaAlertLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ServiceQuotaRule.Arn
+
+  #------------------------------------------------------------
+  # Lambda Execution Role with least-privilege permissions
+  #------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ServiceQuotaAlertLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref QuotaAlertSNSTopic
+        - PolicyName: OrganizationsReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeAccount
+                Resource: '*'
+        - PolicyName: SupportReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - support:DescribeCases
+                Resource: '*'
+
+Outputs:
+  CentralEventBusArn:
+    Description: ARN of the central event bus - use this value as the StackSet parameter
+    Value: !GetAtt CentralEventBus.Arn
+    Export:
+      Name: ServiceQuotaMonitoringBusArn
+  CentralEventBusName:
+    Description: Name of the central event bus
+    Value: !Ref CentralEventBus
+  SNSTopicArn:
+    Description: ARN of the SNS alert topic
+    Value: !Ref QuotaAlertSNSTopic
+  LambdaFunctionArn:
+    Description: ARN of the processing Lambda function
+    Value: !GetAtt QuotaAlertLambda.Arn
